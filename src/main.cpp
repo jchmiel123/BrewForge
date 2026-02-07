@@ -220,6 +220,15 @@ unsigned long recordStartTime = 0;
 unsigned long playStartTime = 0;
 int playIndex = 0;
 
+// ============ HMI DISPLAY (ESP32 Yellow Board via UART) ============
+// Serial1 on GP8 (TX) / GP9 (RX) connects to ESP32 HMI display
+// Sends JSON status updates, receives single-char commands
+#define HMI_TX 8
+#define HMI_RX 9
+#define HMI_BAUD 115200
+unsigned long lastHmiUpdate = 0;
+unsigned long hmiUpdateInterval = 500;  // 500ms during brew, 2000ms idle
+
 // ============ FORWARD DECLARATIONS ============
 void flowSensorISR();
 void updateFlowRate();
@@ -281,6 +290,11 @@ void setup() {
     Serial.begin(115200);
     delay(2000);
 
+    // HMI display UART (Serial1 on GP8/GP9)
+    Serial1.setTX(HMI_TX);
+    Serial1.setRX(HMI_RX);
+    Serial1.begin(HMI_BAUD);
+
     // Initialize EEPROM and load saved settings
     EEPROM.begin(EEPROM_SIZE);
     loadSettings();
@@ -318,6 +332,11 @@ void setup() {
     Serial.println(testMode ? "ON (15s preheat)" : "OFF (real temp)");
     Serial.print("Flow sensor: ");
     Serial.println(flowSensorEnabled ? "ENABLED" : "DISABLED");
+    Serial.print("HMI UART: GP");
+    Serial.print(HMI_TX);
+    Serial.print("(TX) GP");
+    Serial.print(HMI_RX);
+    Serial.println("(RX)");
     Serial.println();
 
     // Setup WiFi (non-blocking - connects in background)
@@ -518,10 +537,25 @@ void loop() {
         }
     }
 
-    // Serial commands
+    // Serial commands (USB debug)
     if (Serial.available()) {
         char cmd = Serial.read();
         handleCommand(cmd);
+    }
+
+    // HMI display commands (Serial1 from ESP32)
+    if (Serial1.available()) {
+        char cmd = Serial1.read();
+        handleCommand(cmd);
+    }
+
+    // Periodic JSON status to HMI display
+    {
+        unsigned long interval = (brewState != IDLE && brewState != DONE) ? 500 : 2000;
+        if (now - lastHmiUpdate >= interval) {
+            lastHmiUpdate = now;
+            Serial1.println(getStatusJson());
+        }
     }
 
     // Handle web requests (WiFi STA or AP mode)

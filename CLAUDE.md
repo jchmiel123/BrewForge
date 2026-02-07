@@ -21,12 +21,21 @@ Forked from PicoTest (2026-02-05).
 | GP5 | Boiler heater relay | Active HIGH |
 | GP6 | Flow sensor | Pulse input with ISR |
 | GP7 | External brew button | Active LOW, internal pullup, wire to GND |
+| GP8 | HMI UART TX (Serial1) | To ESP32 HMI GPIO16 (RX) |
+| GP9 | HMI UART RX (Serial1) | From ESP32 HMI GPIO17 (TX) |
 | GP26 | Thermistor | ADC0 (10K NTC) |
 | GP27 | Optional group head temp | ADC1 (reserved) |
 | GP28 | Optional pressure sensor | ADC2 (reserved) |
 | LED_BUILTIN | Status LED | Via CYW43 chip |
 
 **Reserved (WiFi chip):** GP23, GP24, GP25, GP29
+
+## HMI Display (ESP32-2432S028)
+
+Connected via Serial1 UART at 115200 baud.
+- Pico sends `getStatusJson()` every 500ms (brew) / 2000ms (idle)
+- ESP32 sends single-char commands (B, X, N, V, +, -, S, etc.)
+- **Wiring:** GP8(TX1) -> ESP32 GPIO16(RX), GP9(RX1) -> ESP32 GPIO17(TX), GND -> GND
 
 ## WiFi Networks
 
