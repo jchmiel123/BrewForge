@@ -32,6 +32,7 @@
 #endif
 #include <hardware/watchdog.h>
 #include <EEPROM.h>
+#include "wifi_secrets.h"  // local credentials, gitignored - copy wifi_secrets.h.example
 // OTA removed - Updater.h doesn't work on RP2350 (Error 4). See ForgeRepo/CAPABILITIES.md
 
 // EEPROM layout for saving settings
@@ -55,15 +56,12 @@ struct WiFiNetwork {
     const char* pass;
 };
 
-const WiFiNetwork WIFI_NETWORKS[] = {
-    {"Founders3-Office", "Gu1fR3serVe13"},
-    {"DropitlikeitsHotspot", "Nutmeg21"}
-};
+const WiFiNetwork WIFI_NETWORKS[] = WIFI_SECRETS;  // from wifi_secrets.h (gitignored)
 const int NUM_NETWORKS = sizeof(WIFI_NETWORKS) / sizeof(WIFI_NETWORKS[0]);
 
 // Fallback AP mode settings
 const char* AP_SSID = "BrewForge";
-const char* AP_PASS = "coffee123";  // Min 8 chars
+const char* AP_PASS = AP_PASS_SECRET;  // Min 8 chars
 bool apMode = false;
 
 WebServer server(80);
@@ -147,7 +145,7 @@ float tempRatePerSec = 0.0;       // Degrees C per second
 float estimatedTimeToTarget = -1.0; // Seconds, -1 = unknown
 
 // Info page password
-const char* INFO_PASSWORD = "Coffee4Me!";
+const char* INFO_PASSWORD = INFO_PASSWORD_SECRET;
 
 // ============ BREW SETTINGS ============
 const unsigned long BREW_TIME_MS = 25000;  // 25 seconds (standard espresso)
