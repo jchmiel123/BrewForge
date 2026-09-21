@@ -1,1 +1,9 @@
 .pio
+
+# editor / build junk
+*.bak
+*~
+*.swp
+__pycache__/
+*.pyc
+.fuse_hidden*

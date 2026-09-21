@@ -24,9 +24,13 @@
  */
 
 #include <Arduino.h>
+#define ENABLE_WIFI  // WiFi enabled - uses deferred init + watchdog for crash safety
+#ifdef ENABLE_WIFI
 #include <WiFi.h>
 #include <WebServer.h>
 #include <LEAmDNS.h>
+#endif
+#include <hardware/watchdog.h>
 #include <EEPROM.h>
 // OTA removed - Updater.h doesn't work on RP2350 (Error 4). See ForgeRepo/CAPABILITIES.md
 
@@ -43,6 +47,7 @@ struct SavedSettings {
     uint16_t skipPrimeThresholdSec; // Seconds threshold to skip pressurize
 };
 
+#ifdef ENABLE_WIFI
 // ============ WIFI CONFIG ============
 // Multiple networks - will try each in order
 struct WiFiNetwork {
@@ -62,6 +67,15 @@ const char* AP_PASS = "coffee123";  // Min 8 chars
 bool apMode = false;
 
 WebServer server(80);
+
+// Deferred WiFi init - let board stabilize before touching CYW43
+const unsigned long WIFI_INIT_DELAY_MS = 5000;  // Wait 5s after boot
+bool wifiInitStarted = false;
+bool wifiCrashDetected = false;  // Set if watchdog rebooted us
+#endif
+
+// Watchdog timeout (ms) - resets board if firmware hangs
+const unsigned long WDT_TIMEOUT_MS = 8000;
 
 // ============ PIN DEFINITIONS ============
 // Relays - matched to Justin's wiring
@@ -142,7 +156,7 @@ const float MIN_BREW_TEMP = 85.0;  // Minimum temp to start brewing
 unsigned long brewTimeMs = BREW_TIME_MS;  // Adjustable via web UI
 
 // TEST MODE: Skip temp check, use timer instead
-bool testMode = true;  // Set to false for production with real thermistor
+bool testMode = false;  // false = real temp sensing, true = timer-only preheat
 const unsigned long TEST_PREHEAT_MS = 15000;  // 15 seconds for testing
 
 // SOFT PUMP MODE: Pulse pump to prevent hose kinking
@@ -188,10 +202,10 @@ unsigned int stepTimes[] = {
     0,    // 0: IDLE - not used
     1,    // 1: TEMP_CHECK - quick
     2,    // 2: PRESSURIZE - quick prime burst from RO
-    15,   // 3: PREHEAT - 15 sec heater only
+    20,   // 3: PREHEAT - max 20s heater (exits early when temp reached)
     4,    // 4: PRIME/POP - pump+heater to pop pod
     1,    // 5: PAUSE - brief
-    15,   // 6: BREW - main extraction pump+heater
+    25,   // 6: BREW - main extraction pump+heater
     3,    // 7: COOLDOWN - pump only, no heat
     0     // 8: DONE - auto back to idle
 };
@@ -201,33 +215,7 @@ unsigned long stepStartTime = 0;  // When current step started
 // Step names for display
 const char* stepNames[] = {"IDLE", "TEMP_CHECK", "PRESSURIZE", "PREHEAT", "PRIME", "PAUSE", "BREW", "COOLDOWN", "DONE"};
 
-// ============ LEARN BREW (Recording Mode) ============
-// Records relay actions with timestamps for perfect playback
-#define MAX_RECORDED_ACTIONS 50
-#define SIMULTANEOUS_THRESHOLD_MS 100  // Actions within 100ms = simultaneous
-
-struct RecordedAction {
-    unsigned long timeMs;    // Time since recording started
-    uint8_t relay;           // Which relay (0=pump, 1=boiler, 2=solenoid, 3=warmer)
-    bool state;              // ON or OFF
-};
-
-RecordedAction recordedActions[MAX_RECORDED_ACTIONS];
-int recordedCount = 0;
-bool isRecording = false;
-bool isPlaying = false;
-unsigned long recordStartTime = 0;
-unsigned long playStartTime = 0;
-int playIndex = 0;
-
-// ============ HMI DISPLAY (ESP32 Yellow Board via UART) ============
-// Serial1 on GP8 (TX) / GP9 (RX) connects to ESP32 HMI display
-// Sends JSON status updates, receives single-char commands
-#define HMI_TX 8
-#define HMI_RX 9
-#define HMI_BAUD 115200
-unsigned long lastHmiUpdate = 0;
-unsigned long hmiUpdateInterval = 500;  // 500ms during brew, 2000ms idle
+// HMI display now communicates via WiFi HTTP (ESP32 polls /status endpoint)
 
 // ============ FORWARD DECLARATIONS ============
 void flowSensorISR();
@@ -248,24 +236,22 @@ void abortBrew(const char* reason);
 void nextStep();
 void prevStep();
 void goToStep(BrewState step);
+#ifdef ENABLE_WIFI
 void setupWiFi();
 void updateWiFi();
 void setupWebServer();
+#endif
 void saveSettings();
 void loadSettings();
-void startRecording();
-void stopRecording();
-void recordAction(int relay, bool state);
-void startPlayback();
-void updatePlayback();
-void saveRecording();
-void loadRecording();
 unsigned long timeSinceLastBrewSec();
 bool shouldSkipPressurize();
 String getStatusJson();
+#ifdef ENABLE_WIFI
 String getWebPage();
+#endif
 float toFahrenheit(float c);
 
+#ifdef ENABLE_WIFI
 // WiFi state (defined here for forward reference)
 extern int wifiNetworkIndex;
 extern unsigned long wifiConnectStart;
@@ -274,6 +260,7 @@ extern bool wifiSetupDone;
 extern int wifiRetryCount;
 extern unsigned int pollInterval;
 extern bool apMode;
+#endif
 
 // ============ SETUP ============
 void setup() {
@@ -288,17 +275,22 @@ void setup() {
     pinMode(RELAY_WARMER, OUTPUT);
 
     Serial.begin(115200);
-    delay(2000);
+    // Wait for USB CDC to connect (up to 3s), then continue regardless
+    unsigned long serialWait = millis();
+    while (!Serial && (millis() - serialWait < 3000)) delay(10);
 
-    // HMI display UART (Serial1 on GP8/GP9)
-    Serial1.setTX(HMI_TX);
-    Serial1.setRX(HMI_RX);
-    Serial1.begin(HMI_BAUD);
+    // Check if we rebooted from a watchdog reset
+    bool wdtReboot = watchdog_caused_reboot();
+
+    Serial.println("ALIVE");  // Debug: confirms firmware is running
+    if (wdtReboot) {
+        Serial.println("*** WATCHDOG REBOOT DETECTED ***");
+        Serial.println("Previous firmware hung - watchdog saved us");
+    }
 
     // Initialize EEPROM and load saved settings
     EEPROM.begin(EEPROM_SIZE);
     loadSettings();
-    loadRecording();
 
     // Flow sensor with pullup, interrupt on rising edge
     pinMode(FLOW_SENSOR, INPUT_PULLUP);
@@ -332,15 +324,22 @@ void setup() {
     Serial.println(testMode ? "ON (15s preheat)" : "OFF (real temp)");
     Serial.print("Flow sensor: ");
     Serial.println(flowSensorEnabled ? "ENABLED" : "DISABLED");
-    Serial.print("HMI UART: GP");
-    Serial.print(HMI_TX);
-    Serial.print("(TX) GP");
-    Serial.print(HMI_RX);
-    Serial.println("(RX)");
+    Serial.println("HMI: WiFi (ESP32 polls /status)");
     Serial.println();
 
-    // Setup WiFi (non-blocking - connects in background)
-    setupWiFi();
+#ifdef ENABLE_WIFI
+    if (wdtReboot) {
+        wifiCrashDetected = true;
+        Serial.println("WiFi DEFERRED - last boot crashed (watchdog)");
+        Serial.println("WiFi will attempt init in 10 seconds...");
+    } else {
+        Serial.println("WiFi will init in 5 seconds (deferred)...");
+    }
+#endif
+
+    // Enable hardware watchdog - auto-resets if loop() hangs
+    rp2040.wdt_begin(WDT_TIMEOUT_MS);
+    Serial.println("Watchdog enabled (8s timeout)");
 
     printHelp();
 }
@@ -360,8 +359,22 @@ void loop() {
 
     unsigned long now = millis();
 
-    // Non-blocking WiFi connection
-    updateWiFi();
+    // Feed the watchdog - if we hang, board auto-resets
+    rp2040.wdt_reset();
+
+#ifdef ENABLE_WIFI
+    // Deferred WiFi init - don't touch CYW43 until board is stable
+    if (!wifiInitStarted) {
+        unsigned long wifiDelay = wifiCrashDetected ? 10000 : WIFI_INIT_DELAY_MS;
+        if (now >= wifiDelay) {
+            Serial.println("Starting WiFi init now...");
+            wifiInitStarted = true;
+            setupWiFi();
+        }
+    } else {
+        updateWiFi();
+    }
+#endif
 
     // Read BOOTSEL button (built into Pico)
     bool bootselPressed = BOOTSEL;
@@ -466,9 +479,6 @@ void loop() {
     // Run the brew state machine
     updateBrewCycle();
 
-    // Run playback if active
-    updatePlayback();
-
     // Auto status print every 2 seconds if not idle
     static unsigned long lastIdleStatus = 0;
     if (brewState != IDLE && (now - lastStatusPrint >= 2000)) {
@@ -521,20 +531,28 @@ void loop() {
             else { Serial.print(sec / 3600); Serial.print("h"); }
             Serial.print(" ago | ");
         }
-        if (apMode) {
-            Serial.print("AP: ");
-            Serial.print(AP_SSID);
-            Serial.print(" | http://");
-            Serial.println(WiFi.softAPIP());
-        } else if (WiFi.status() == WL_CONNECTED) {
-            Serial.print("http://");
-            Serial.print(WiFi.localIP());
-            Serial.print(" | brewforge.local | ");
-            Serial.print(WiFi.RSSI());
-            Serial.println("dBm");
+#ifdef ENABLE_WIFI
+        if (wifiSetupDone) {
+            if (apMode) {
+                Serial.print("AP: ");
+                Serial.print(AP_SSID);
+                Serial.print(" | http://");
+                Serial.println(WiFi.softAPIP());
+            } else if (WiFi.status() == WL_CONNECTED) {
+                Serial.print("http://");
+                Serial.print(WiFi.localIP());
+                Serial.print(" | brewforge.local | ");
+                Serial.print(WiFi.RSSI());
+                Serial.println("dBm");
+            } else {
+                Serial.println("WiFi disconnected");
+            }
         } else {
-            Serial.println("WiFi disconnected");
+            Serial.println("WiFi connecting...");
         }
+#else
+        Serial.println("WiFi disabled");
+#endif
     }
 
     // Serial commands (USB debug)
@@ -543,26 +561,12 @@ void loop() {
         handleCommand(cmd);
     }
 
-    // HMI display commands (Serial1 from ESP32)
-    if (Serial1.available()) {
-        char cmd = Serial1.read();
-        handleCommand(cmd);
-    }
-
-    // Periodic JSON status to HMI display
-    {
-        unsigned long interval = (brewState != IDLE && brewState != DONE) ? 500 : 2000;
-        if (now - lastHmiUpdate >= interval) {
-            lastHmiUpdate = now;
-            Serial1.println(getStatusJson());
-        }
-    }
-
-    // Handle web requests (WiFi STA or AP mode)
+#ifdef ENABLE_WIFI
     if (wifiSetupDone && (apMode || WiFi.status() == WL_CONNECTED)) {
         server.handleClient();
         if (!apMode) MDNS.update();
     }
+#endif
 }
 
 // ============ FLOW SENSOR ISR ============
@@ -1053,14 +1057,17 @@ void handleCommand(char cmd) {
             break;
 
         case 'c': case 'C':
+#ifdef ENABLE_WIFI
             Serial.println("Retrying WiFi...");
             apMode = false;
             wifiSetupDone = false;
             wifiConnecting = false;
             wifiNetworkIndex = 0;
             wifiRetryCount = 0;
-            WiFi.disconnect();
-            WiFi.mode(WIFI_STA);
+            setupWiFi();  // Safe init then background connect
+#else
+            Serial.println("WiFi disabled in this build");
+#endif
             break;
 
         case 't': case 'T':
@@ -1183,16 +1190,29 @@ void printHelp() {
     Serial.println("  1-4   Direct relay toggle");
     Serial.println();
     Serial.println("Brew button (GP7) or BOOTSEL starts/stops brew");
-    Serial.print("Web UI: http://");
-    if (apMode) {
-        Serial.println(WiFi.softAPIP());
+    Serial.print("Web UI: ");
+#ifdef ENABLE_WIFI
+    if (wifiSetupDone) {
+        if (apMode) {
+            Serial.print("http://");
+            Serial.println(WiFi.softAPIP());
+        } else if (WiFi.status() == WL_CONNECTED) {
+            Serial.print("http://");
+            Serial.print(WiFi.localIP());
+            Serial.println(" | http://brewforge.local");
+        } else {
+            Serial.println("WiFi connecting...");
+        }
     } else {
-        Serial.print(WiFi.localIP());
-        Serial.println(" | http://brewforge.local");
+        Serial.println("WiFi not started");
     }
+#else
+    Serial.println("WiFi disabled");
+#endif
     Serial.println();
 }
 
+#ifdef ENABLE_WIFI
 // ============ WIFI & WEB SERVER ============
 
 int wifiNetworkIndex = 0;
@@ -1279,6 +1299,7 @@ void setupWiFi() {
     WiFi.mode(WIFI_STA);
     Serial.println("WiFi will connect in background...");
 }
+#endif // ENABLE_WIFI
 
 float toFahrenheit(float c) {
     return c * 9.0 / 5.0 + 32.0;
@@ -1343,130 +1364,6 @@ void loadSettings() {
     }
 }
 
-// ============ LEARN BREW FUNCTIONS ============
-
-void startRecording() {
-    if (isPlaying) return;
-    allRelaysOff();
-    recordedCount = 0;
-    isRecording = true;
-    recordStartTime = millis();
-    Serial.println("=== RECORDING STARTED ===");
-    Serial.println("Toggle relays to record your brew sequence.");
-}
-
-void stopRecording() {
-    if (!isRecording) return;
-    isRecording = false;
-    Serial.println("=== RECORDING STOPPED ===");
-    Serial.print("Recorded ");
-    Serial.print(recordedCount);
-    Serial.println(" actions.");
-    allRelaysOff();
-}
-
-void recordAction(int relay, bool state) {
-    if (!isRecording || recordedCount >= MAX_RECORDED_ACTIONS) return;
-
-    unsigned long now = millis();
-    unsigned long elapsed = now - recordStartTime;
-
-    if (recordedCount > 0) {
-        unsigned long prevTime = recordedActions[recordedCount - 1].timeMs;
-        if (elapsed - prevTime < SIMULTANEOUS_THRESHOLD_MS) {
-            elapsed = prevTime;
-        }
-    }
-
-    recordedActions[recordedCount].timeMs = elapsed;
-    recordedActions[recordedCount].relay = relay;
-    recordedActions[recordedCount].state = state;
-    recordedCount++;
-
-    const char* relayNames[] = {"Pump", "Boiler", "Solenoid", "Warmer"};
-    Serial.print("REC [");
-    Serial.print(elapsed / 1000.0, 1);
-    Serial.print("s] ");
-    Serial.print(relayNames[relay]);
-    Serial.println(state ? " ON" : " OFF");
-}
-
-void startPlayback() {
-    if (isRecording || recordedCount == 0) return;
-    isPlaying = true;
-    playStartTime = millis();
-    playIndex = 0;
-    Serial.println("=== PLAYBACK STARTED ===");
-    Serial.print("Playing ");
-    Serial.print(recordedCount);
-    Serial.println(" recorded actions.");
-}
-
-void updatePlayback() {
-    if (!isPlaying) return;
-
-    unsigned long elapsed = millis() - playStartTime;
-
-    while (playIndex < recordedCount && recordedActions[playIndex].timeMs <= elapsed) {
-        RecordedAction& action = recordedActions[playIndex];
-
-        const int relayPins[] = {RELAY_PUMP, RELAY_BOILER, RELAY_SOLENOID, RELAY_WARMER};
-        const char* relayNames[] = {"Pump", "Boiler", "Solenoid", "Warmer"};
-        bool* relayStates[] = {&pumpOn, &heaterOn, &solenoidOn, &warmerOn};
-
-        *relayStates[action.relay] = action.state;
-        digitalWrite(relayPins[action.relay], action.state ? RELAY_ON : RELAY_OFF);
-
-        Serial.print("PLAY [");
-        Serial.print(action.timeMs / 1000.0, 1);
-        Serial.print("s] ");
-        Serial.print(relayNames[action.relay]);
-        Serial.println(action.state ? " ON" : " OFF");
-
-        playIndex++;
-    }
-
-    if (playIndex >= recordedCount) {
-        isPlaying = false;
-        Serial.println("=== PLAYBACK COMPLETE ===");
-    }
-}
-
-void saveRecording() {
-    int addr = sizeof(SavedSettings);
-    EEPROM.put(addr, recordedCount);
-    addr += sizeof(recordedCount);
-
-    for (int i = 0; i < recordedCount; i++) {
-        EEPROM.put(addr, recordedActions[i]);
-        addr += sizeof(RecordedAction);
-    }
-
-    EEPROM.commit();
-    Serial.println("Recording SAVED to flash!");
-}
-
-void loadRecording() {
-    int addr = sizeof(SavedSettings);
-
-    int count;
-    EEPROM.get(addr, count);
-    addr += sizeof(count);
-
-    if (count > 0 && count <= MAX_RECORDED_ACTIONS) {
-        recordedCount = count;
-        for (int i = 0; i < recordedCount; i++) {
-            EEPROM.get(addr, recordedActions[i]);
-            addr += sizeof(RecordedAction);
-        }
-        Serial.print("Loaded ");
-        Serial.print(recordedCount);
-        Serial.println(" recorded actions.");
-    } else {
-        recordedCount = 0;
-        Serial.println("No recorded sequence found.");
-    }
-}
 
 String getStatusJson() {
     unsigned long stepElapsed = (millis() - stepStartTime) / 1000;
@@ -1499,19 +1396,25 @@ String getStatusJson() {
     json += "\"solenoid\":" + String(solenoidOn ? "true" : "false") + ",";
     json += "\"warmer\":" + String(warmerOn ? "true" : "false") + ",";
     json += "\"minTemp\":" + String(MIN_BREW_TEMP, 0) + ",";
-    json += "\"wifiConnected\":" + String(WiFi.status() == WL_CONNECTED ? "true" : "false") + ",";
-    json += "\"ip\":\"" + WiFi.localIP().toString() + "\",";
-    json += "\"ssid\":\"" + WiFi.SSID() + "\",";
-    json += "\"rssi\":" + String(WiFi.RSSI()) + ",";
+#ifdef ENABLE_WIFI
+    if (wifiSetupDone) {
+        json += "\"wifiConnected\":" + String(WiFi.status() == WL_CONNECTED ? "true" : "false") + ",";
+        json += "\"ip\":\"" + WiFi.localIP().toString() + "\",";
+        json += "\"ssid\":\"" + WiFi.SSID() + "\",";
+        json += "\"rssi\":" + String(WiFi.RSSI()) + ",";
+    } else {
+        json += "\"wifiConnected\":false,\"ip\":\"0.0.0.0\",\"ssid\":\"\",\"rssi\":0,";
+    }
+    json += "\"pollInterval\":" + String(pollInterval) + ",";
+#else
+    json += "\"wifiConnected\":false,\"ip\":\"0.0.0.0\",\"ssid\":\"\",\"rssi\":0,";
+    json += "\"pollInterval\":500,";
+#endif
     json += "\"uptime\":" + String(millis() / 1000) + ",";
     json += "\"freeHeap\":" + String(rp2040.getFreeHeap()) + ",";
-    json += "\"pollInterval\":" + String(pollInterval) + ",";
     json += "\"testMode\":" + String(testMode ? "true" : "false") + ",";
     json += "\"softPump\":" + String(softPumpMode ? "true" : "false") + ",";
     json += "\"flowEnabled\":" + String(flowSensorEnabled ? "true" : "false") + ",";
-    json += "\"recording\":" + String(isRecording ? "true" : "false") + ",";
-    json += "\"playing\":" + String(isPlaying ? "true" : "false") + ",";
-    json += "\"recCount\":" + String(recordedCount) + ",";
     json += "\"tempRate\":" + String(tempRatePerSec, 2) + ",";
     json += "\"etaTarget\":" + String(estimatedTimeToTarget, 0) + ",";
     json += "\"lastBrewSec\":" + String(timeSinceLastBrewSec()) + ",";
@@ -1521,6 +1424,7 @@ String getStatusJson() {
     return json;
 }
 
+#ifdef ENABLE_WIFI
 // Poll interval in ms
 unsigned int pollInterval = 500;
 
@@ -1561,7 +1465,6 @@ const char MAIN_PAGE[] PROGMEM = R"rawliteral(<!DOCTYPE html><html><head><meta n
 <div class="c"><div class="sb"><span class="st IDLE" id="state">IDLE</span><span class="tm" id="timer"></span><span id="extBtn" style="color:#8b949e;font-size:11px">BTN: ready</span></div>
 <div class="rl"><button class="rb off" id="pump" onclick="T('pump')">Pump (GP4)</button><button class="rb off" id="boiler" onclick="T('boiler')">Boiler (GP5)</button><button class="rb off" id="solenoid" onclick="T('solenoid')">Solenoid (GP2)</button><button class="rb off" id="warmer" onclick="T('warmer')">Warmer (GP3)</button></div></div>
 <div class="c bb"><button class="bn" style="background:#8b949e" onclick="P()">&lt; BACK</button><button class="bn bg" onclick="B()">BREW</button><button class="bn" style="background:#58a6ff" onclick="NX()">NEXT &gt;</button><button class="bn br" onclick="S()">STOP</button></div>
-<div class="c" style="display:flex;gap:10px;justify-content:center"><button class="bn" id="btnRec" style="background:#da3633" onclick="doRec()">REC</button><button class="bn" id="btnPlay" style="background:#238636" onclick="doPlay()">PLAY</button><button class="rt" onclick="doSaveRec()">Save Seq</button><span id="recStatus" style="color:#8b949e;font-size:11px;align-self:center"></span></div>
 <div class="c ss"><div class="se"><div class="sl">Target (<span id="tul">C</span>)</div><div class="sv" id="tv">93</div><button class="ab am" onclick="A('temp',-5)">-</button><button class="ab ap" onclick="A('temp',5)">+</button></div></div>
 <div class="c" style="font-size:11px"><table style="width:100%;text-align:center;border-collapse:collapse"><tr style="color:#8b949e"><td>CHECK</td><td>PRESS</td><td>HEAT</td><td>PRIME</td><td>PAUSE</td><td>BREW</td><td>COOL</td></tr><tr><td><span id="t1">1</span>s</td><td><span id="t2">2</span>s</td><td><span id="t3">15</span>s</td><td><span id="t4">4</span>s</td><td><span id="t5">1</span>s</td><td><span id="t6">15</span>s</td><td><span id="t7">3</span>s</td></tr><tr><td><button class="rt" onclick="ST(1,-1)">-</button><button class="rt" onclick="ST(1,1)">+</button></td><td><button class="rt" onclick="ST(2,-1)">-</button><button class="rt" onclick="ST(2,1)">+</button></td><td><button class="rt" onclick="ST(3,-5)">-</button><button class="rt" onclick="ST(3,5)">+</button></td><td><button class="rt" onclick="ST(4,-1)">-</button><button class="rt" onclick="ST(4,1)">+</button></td><td><button class="rt" onclick="ST(5,-1)">-</button><button class="rt" onclick="ST(5,1)">+</button></td><td><button class="rt" onclick="ST(6,-5)">-</button><button class="rt" onclick="ST(6,5)">+</button></td><td><button class="rt" onclick="ST(7,-1)">-</button><button class="rt" onclick="ST(7,1)">+</button></td></tr></table></div>
 <div class="c"><div class="fi"><div><div class="fv" id="flow">0</div><div class="fl">mL/s</div></div><div><div class="fv" id="vol">0</div><div class="fl">mL</div></div></div><center><button class="rt" onclick="fetch('/reset')">Reset</button></center></div>
@@ -1636,10 +1539,6 @@ document.getElementById('cbSoft').checked=d.softPump;
 document.getElementById('cbTest').checked=d.testMode;
 document.getElementById('cbFlow').checked=d.flowEnabled;
 for(var i=1;i<=7;i++){document.getElementById('t'+i).textContent=d.times[i]}
-var br=document.getElementById('btnRec');var bp=document.getElementById('btnPlay');var rs=document.getElementById('recStatus');
-br.textContent=d.recording?'STOP REC':'REC';br.style.background=d.recording?'#f85149':'#da3633';
-bp.textContent=d.playing?'STOP':'PLAY';bp.style.background=d.playing?'#f85149':'#238636';
-rs.textContent=d.recCount>0?d.recCount+' actions':'No seq';
 var rate=d.tempRate;var rateStr='';
 if(d.step>=1&&d.step<=7){rateStr=(rate>=0?'+':'')+rate.toFixed(1)+'\u00B0/s';if(d.etaTarget>0&&d.step<=3)rateStr+=' | ETA: '+Math.round(d.etaTarget)+'s'}
 document.getElementById('tempRate').textContent=rateStr;
@@ -1653,9 +1552,6 @@ var L=0;function T(r){if(L)return;L=1;fetch('/toggle?r='+r).then(x=>x.json()).th
 function B(){fetch('/brew')}function S(){fetch('/stop')}function NX(){fetch('/next')}function P(){fetch('/prev')}function A(w,d){fetch('/adj?what='+w+'&delta='+d)}
 function ST(s,d){fetch('/steptime?s='+s+'&d='+d).then(r=>r.text()).then(v=>{document.getElementById('t'+s).textContent=v})}
 function doSave(){fetch('/save').then(r=>r.text()).then(x=>{alert('Settings saved!')})}
-function doRec(){fetch('/rec').then(r=>r.text()).then(x=>{alert(x);U()})}
-function doPlay(){fetch('/play').then(r=>r.text()).then(x=>{alert(x);U()})}
-function doSaveRec(){fetch('/saverec').then(r=>r.text()).then(x=>{alert(x)})}
 function toggleUnit(){fetch('/togglef').then(r=>r.text()).then(u=>{uF=(u==='F');U()})}
 function showInfo(){document.getElementById('infopanel').style.display='block';document.getElementById('infolock').style.display='block';document.getElementById('infocontent').style.display='none';document.getElementById('infopw').value='';document.getElementById('infopw').focus()}
 function hideInfo(){document.getElementById('infopanel').style.display='none'}
@@ -1726,60 +1622,20 @@ void setupWebServer() {
         server.send(200, "text/plain", "SAVED!");
     });
 
-    server.on("/rec", []() {
-        String msg;
-        if (isRecording) {
-            stopRecording();
-            msg = "STOPPED - " + String(recordedCount) + " actions recorded";
-        } else {
-            startRecording();
-            msg = "RECORDING - Toggle relays now!";
-        }
-        server.send(200, "text/plain", msg);
-    });
-
-    server.on("/play", []() {
-        String msg;
-        if (isPlaying) {
-            isPlaying = false;
-            allRelaysOff();
-            msg = "STOPPED playback";
-        } else if (recordedCount == 0) {
-            msg = "Nothing recorded! Record first.";
-        } else {
-            startPlayback();
-            msg = "PLAYING " + String(recordedCount) + " actions...";
-        }
-        server.send(200, "text/plain", msg);
-    });
-
-    server.on("/saverec", []() {
-        if (recordedCount == 0) {
-            server.send(200, "text/plain", "Nothing to save! Record first.");
-        } else {
-            saveRecording();
-            server.send(200, "text/plain", "Saved " + String(recordedCount) + " actions to flash!");
-        }
-    });
-
     server.on("/toggle", []() {
         String relay = server.arg("r");
         if (relay == "pump") {
             pumpOn = !pumpOn;
             setRelay(RELAY_PUMP, pumpOn, "Pump");
-            if (isRecording) recordAction(0, pumpOn);
         } else if (relay == "boiler") {
             heaterOn = !heaterOn;
             setRelay(RELAY_BOILER, heaterOn, "Boiler");
-            if (isRecording) recordAction(1, heaterOn);
         } else if (relay == "solenoid") {
             solenoidOn = !solenoidOn;
             setRelay(RELAY_SOLENOID, solenoidOn, "Solenoid");
-            if (isRecording) recordAction(2, solenoidOn);
         } else if (relay == "warmer") {
             warmerOn = !warmerOn;
             setRelay(RELAY_WARMER, warmerOn, "Warmer");
-            if (isRecording) recordAction(3, warmerOn);
         }
         server.send(200, "application/json", getStatusJson());
     });
@@ -1909,3 +1765,4 @@ void setupWebServer() {
         MDNS.addService("http", "tcp", 80);
     }
 }
+#endif // ENABLE_WIFI
